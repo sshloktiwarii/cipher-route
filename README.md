@@ -1,57 +1,64 @@
-# ⚡ cipher-route — Unified Ingress Gateway, Semantic Cache & Circuit Breaker
+# cipher-route
 
-[![Language](https://img.shields.io/badge/Language-Go%201.24-00ADD8?style=flat-square&logo=go)](https://go.dev/)
-[![Status](https://img.shields.io/badge/Status-Production%20Ready-brightgreen?style=flat-square)](#)
-[![Zero-Port-Sprawl](https://img.shields.io/badge/Networking-Zero--Port%20Sprawl-blueviolet?style=flat-square)](#)
+Unified HTTP ingress reverse proxy, semantic vector cache, and circuit breaker.
 
-The unified ingress traffic controller, semantic cache, and cloud circuit breaker for the **Cipher AI PaaS**. Eliminates port sprawl by proxying all 5 backend microservices via internal Unix Domain Sockets behind a single public port (`:8080`), protected by zero-trust session token authentication.
+Written in pure Go. Eliminates host port sprawl by aggregating all backend microservices via Unix domain sockets in `/tmp/cipher/*.sock` behind port `8080`, secured with local cryptographic session token authorization.
 
 ---
 
-### 💡 For Non-Techies: What does this do?
-> Imagine an intelligent air-traffic controller for all AI conversations on your computer:
->
-> 1. **Zero Mess (One Door In)**: Instead of having 8 different confusing ports open on your machine, `cipher-route` gives you one clean front door (`http://localhost:8080`).
-> 2. **Saves Time & Money (Instant Cache)**: If you ask the AI a question that was asked before, `cipher-route` remembers the answer and returns it in **0.5 milliseconds** without recalculating.
-> 3. **Never Crashes (Smart Cloud Fallback)**: It tries to run your AI locally on your computer. If your local model is offline or out of memory, it automatically and seamlessly routes the request to cloud providers (like Groq or OpenAI) using real circuit breakers.
-> 4. **Locked by Default**: Generates a private secret key on your machine (`~/.cipher/token`) so strangers on your WiFi cannot access your AI.
+## Routing Architecture
+
+```text
+HTTP Request (:8080) ---> [Token Auth Gate] ---> [Semantic Vector Cache]
+                                                         |
+                   +-------------------------------------+-------------------------------------+
+                   | (Cache Hit: <0.5ms)                                                       | (Cache Miss)
+                   v                                                                           v
+         Return Cached JSON                                                     [Token Threshold Evaluator]
+                                                                                               |
+                                                 +---------------------------------------------+---------------------------------------------+
+                                                 | (<1000 Tokens)                                                                            | (>=1000 Tokens)
+                                                 v                                                                                           v
+                                            Local Ollama                                                                             Cloud Circuit Breakers
+                                        (3s Low-Latency Cutoff)                                                                     (Groq / OpenAI Key Rotators)
+```
 
 ---
 
-## Unified Ingress Routes (Zero-Port Sprawl)
+## Ingress Socket Map
 
-All internal services communicate with `cipher-route` via Unix Domain Sockets (`/tmp/cipher/*.sock`), exposing only port `:8080`:
+All internal cluster services are proxied through `/tmp/cipher/*.sock` (`0600` permissions):
 
-| Public Endpoint | Proxied Backend | Transport | Security Gate |
+| Path Prefix | Target Socket | Underlying Service | Gate |
 | :--- | :--- | :--- | :--- |
-| `GET /hud` | Cockpit War Room Visual HUD | Embedded HTML5 | Public / Localhost |
-| `GET /cluster/status` | Cluster Topology & Health | Internal Probe | Public / Localhost |
-| `GET /verify-audit-chain` | Cryptographic Merkle Hash Chain | `/tmp/cipher/log.sock` | Public / Localhost |
-| `POST /v1/chat/completions` | Local Ollama $\to$ Cloud Fallback | Real Upstream | Bearer Token Required |
-| `ANY /api/sec/*` | `cipher-sec` Semantic Firewall | `/tmp/cipher/sec.sock` | Bearer Token Required |
-| `ANY /api/exec/*` | `cipher-exec` Sandbox | `/tmp/cipher/exec.sock` | Bearer Token Required |
-| `ANY /api/log/*` | `cipher-log` Merkle Ledger | `/tmp/cipher/log.sock` | Bearer Token Required |
-| `ANY /api/mem/*` | `cipher-mem` Vector Store | `/tmp/cipher/mem.sock` | Bearer Token Required |
-| `ANY /api/mcp/*` | `cipher-mcp` Action Server | `/tmp/cipher/mcp.sock` | Bearer Token Required |
+| `/hud` | Embedded HTML | Web Cockpit HUD | Public |
+| `/cluster/status` | Internal Probe | Cluster Topology & Sockets | Public |
+| `/verify-audit-chain` | `/tmp/cipher/log.sock` | Merkle Chain Integrity | Public |
+| `/v1/chat/completions` | Local Ollama / Real Cloud | Fallback Gateway | Bearer Auth |
+| `/api/sec/*` | `/tmp/cipher/sec.sock` | Semantic Firewall | Bearer Auth |
+| `/api/exec/*` | `/tmp/cipher/exec.sock` | Seatbelt Sandbox | Bearer Auth |
+| `/api/log/*` | `/tmp/cipher/log.sock` | Telemetry & Ledger | Bearer Auth |
+| `/api/mem/*` | `/tmp/cipher/mem.sock` | Obsidian Vector Store | Bearer Auth |
+| `/api/mcp/*` | `/tmp/cipher/mcp.sock` | MCP JSON-RPC Server | Bearer Auth |
 
 ---
 
-## Quickstart
+## Build
 
-### Build Standalone Binary
 ```bash
 go build -o cipher-route .
 ```
 
-### Run Standalone
+---
+
+## Usage
+
 ```bash
 PORT=8080 ./cipher-route
 ```
 
-### View Live Cockpit HUD
-Open `http://localhost:8080/hud` in any web browser.
-
 ---
 
 ## License
-MIT © [Shlok Tiwari](https://github.com/sshloktiwarii)
+
+MIT License. Copyright (c) 2026 Shlok Tiwari.
