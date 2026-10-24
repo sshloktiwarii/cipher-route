@@ -1,8 +1,10 @@
 # Binaries
 macr-router
 foundry-router
+cipher-route
 *.exe
 *.test
+
 
 # Environment
 .env

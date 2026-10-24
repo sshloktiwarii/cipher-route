@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	_ "embed"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -25,6 +26,10 @@ import (
 
 	"github.com/redis/go-redis/v9"
 )
+
+//go:embed hud/index.html
+var hudHTML []byte
+
 
 // Config represents runtime gateway parameters
 type Config struct {
@@ -263,6 +268,73 @@ func (rl *RateLimiter) allowInMemory(clientIP string) bool {
 	return rl.localCounts[clientIP] <= rl.limitRPM
 }
 
+// ProxyTarget forwards requests to a Unix Domain Socket with TCP fallback
+type ProxyTarget struct {
+	SocketPath string
+	TCPAddr    string
+	Prefix     string
+	client     *http.Client
+}
+
+func NewProxyTarget(socketPath, tcpAddr, prefix string) *ProxyTarget {
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if _, err := os.Stat(socketPath); err == nil {
+				c, err := net.DialTimeout("unix", socketPath, 500*time.Millisecond)
+				if err == nil {
+					return c, nil
+				}
+			}
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp", tcpAddr)
+		},
+		MaxIdleConns:        100,
+		IdleConnTimeout:     90 * time.Second,
+		DisableCompression: false,
+	}
+
+	return &ProxyTarget{
+		SocketPath: socketPath,
+		TCPAddr:    tcpAddr,
+		Prefix:     prefix,
+		client:     &http.Client{Transport: transport, Timeout: 30 * time.Second},
+	}
+}
+
+func (pt *ProxyTarget) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	subpath := strings.TrimPrefix(r.URL.Path, pt.Prefix)
+	if !strings.HasPrefix(subpath, "/") {
+		subpath = "/" + subpath
+	}
+
+	targetURL := "http://internal.cipher" + subpath
+	if r.URL.RawQuery != "" {
+		targetURL += "?" + r.URL.RawQuery
+	}
+
+	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, r.Body)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"failed to create upstream request: %v"}`, err), http.StatusInternalServerError)
+		return
+	}
+	outReq.Header = r.Header.Clone()
+
+	resp, err := pt.client.Do(outReq)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"upstream service unreachable: %v"}`, err), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	for k, vv := range resp.Header {
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
+}
+
 // RouterGateway implements reverse proxy logic with semantic cache and fallback
 type RouterGateway struct {
 	cfg          Config
@@ -272,6 +344,7 @@ type RouterGateway struct {
 	cloudURL     *url.URL
 	httpClient   *http.Client
 	fallbackHits uint64
+	proxies      map[string]*ProxyTarget
 }
 
 func NewRouterGateway(cfg Config) (*RouterGateway, error) {
@@ -292,6 +365,13 @@ func NewRouterGateway(cfg Config) (*RouterGateway, error) {
 		ollamaURL:  ollamaParsed,
 		cloudURL:   cloudParsed,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
+		proxies: map[string]*ProxyTarget{
+			"/api/sec":  NewProxyTarget("/tmp/cipher/sec.sock", "127.0.0.1:8079", "/api/sec"),
+			"/api/exec": NewProxyTarget("/tmp/cipher/exec.sock", "127.0.0.1:8081", "/api/exec"),
+			"/api/log":  NewProxyTarget("/tmp/cipher/log.sock", "127.0.0.1:8082", "/api/log"),
+			"/api/mem":  NewProxyTarget("/tmp/cipher/mem.sock", "127.0.0.1:8083", "/api/mem"),
+			"/api/mcp":  NewProxyTarget("/tmp/cipher/mcp.sock", "127.0.0.1:8085", "/api/mcp"),
+		},
 	}, nil
 }
 
@@ -333,7 +413,7 @@ func getClientIP(r *http.Request) string {
 func (gw *RouterGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
-	// CORS headers for Next.js dashboard
+	// CORS headers for War Room HUD and Next.js dashboard
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
@@ -342,24 +422,52 @@ func (gw *RouterGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1. Healthcheck
-	if r.URL.Path == "/healthz" {
-		w.Header().Set("Content-Type", "application/json")
+	// 0. Cockpit War Room HUD
+	if r.URL.Path == "/" || r.URL.Path == "/hud" || r.URL.Path == "/warroom" {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"healthy","service":"macr-maximized","semantic_cache":true}`))
+		_, _ = w.Write(hudHTML)
 		return
 	}
 
-	// 2. Metrics endpoint for Next.js Dashboard
+	// 1. Cluster Status Endpoint
+	if r.URL.Path == "/cluster/status" || r.URL.Path == "/api/status" || r.URL.Path == "/status" {
+		gw.handleClusterStatus(w, r)
+		return
+	}
+
+	// 2. Direct Audit Chain Verification Shortcut
+	if r.URL.Path == "/verify-audit-chain" {
+		gw.proxies["/api/log"].ServeHTTP(w, r)
+		return
+	}
+
+	// 3. Healthcheck
+	if r.URL.Path == "/healthz" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"healthy","service":"macr-maximized","semantic_cache":true,"zero_port_sprawl":true}`))
+		return
+	}
+
+	// 4. Metrics endpoint for Next.js Dashboard
 	if r.URL.Path == "/api/metrics" {
 		gw.handleDashboardMetrics(w, r)
 		return
 	}
 
-	// 3. Mock cloud endpoint
+	// 5. Mock cloud endpoint
 	if r.URL.Path == "/mock/cloud/v1/chat/completions" {
 		gw.handleMockCloud(w, r)
 		return
+	}
+
+	// 6. Reverse-proxy to internal microservices via Unix Domain Socket or TCP
+	for prefix, proxy := range gw.proxies {
+		if r.URL.Path == prefix || strings.HasPrefix(r.URL.Path, prefix+"/") {
+			proxy.ServeHTTP(w, r)
+			return
+		}
 	}
 
 	if r.URL.Path != "/v1/chat/completions" {
@@ -503,6 +611,70 @@ func (gw *RouterGateway) handleDashboardMetrics(w http.ResponseWriter, r *http.R
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(metrics)
 }
+
+func (gw *RouterGateway) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
+	targets := []struct {
+		Name   string `json:"service"`
+		Prefix string `json:"prefix"`
+		Socket string `json:"socket"`
+		TCP    string `json:"tcp"`
+	}{
+		{"cipher-sec", "/api/sec", "/tmp/cipher/sec.sock", "127.0.0.1:8079"},
+		{"cipher-exec", "/api/exec", "/tmp/cipher/exec.sock", "127.0.0.1:8081"},
+		{"cipher-log", "/api/log", "/tmp/cipher/log.sock", "127.0.0.1:8082"},
+		{"cipher-mem", "/api/mem", "/tmp/cipher/mem.sock", "127.0.0.1:8083"},
+		{"cipher-mcp", "/api/mcp", "/tmp/cipher/mcp.sock", "127.0.0.1:8085"},
+	}
+
+	services := make([]map[string]interface{}, 0, len(targets))
+	for _, t := range targets {
+		socketActive := false
+		if _, err := os.Stat(t.Socket); err == nil {
+			if c, err := net.DialTimeout("unix", t.Socket, 100*time.Millisecond); err == nil {
+				socketActive = true
+				_ = c.Close()
+			}
+		}
+
+		tcpActive := false
+		if c, err := net.DialTimeout("tcp", t.TCP, 100*time.Millisecond); err == nil {
+			tcpActive = true
+			_ = c.Close()
+		}
+
+		status := "offline"
+		mode := "none"
+		if socketActive {
+			status = "healthy"
+			mode = "unix_domain_socket"
+		} else if tcpActive {
+			status = "healthy"
+			mode = "tcp_fallback"
+		}
+
+		services = append(services, map[string]interface{}{
+			"service": t.Name,
+			"prefix":  t.Prefix,
+			"socket":  t.Socket,
+			"tcp":     t.TCP,
+			"status":  status,
+			"mode":    mode,
+		})
+	}
+
+	resp := map[string]interface{}{
+		"gateway":          "cipher-route",
+		"port":             gw.cfg.Port,
+		"zero_port_sprawl": true,
+		"services":         services,
+		"timestamp":        time.Now().UTC().Format(time.RFC3339),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
 
 func (gw *RouterGateway) handleMockCloud(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
