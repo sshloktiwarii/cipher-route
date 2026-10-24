@@ -1,4 +1,4 @@
-module github.com/sshloktiwarii/model-agnostic-context-router
+module github.com/sshloktiwarii/foundry-router
 
 go 1.24
 
