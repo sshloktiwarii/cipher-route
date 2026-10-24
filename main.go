@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	_ "embed"
 	"encoding/hex"
@@ -17,6 +18,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -335,6 +337,107 @@ func (pt *ProxyTarget) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, resp.Body)
 }
 
+type CircuitBreaker struct {
+	mu          sync.Mutex
+	failures    int
+	maxFailures int
+	lastFailure time.Time
+	cooldown    time.Duration
+}
+
+func NewCircuitBreaker(maxFailures int, cooldown time.Duration) *CircuitBreaker {
+	return &CircuitBreaker{
+		maxFailures: maxFailures,
+		cooldown:    cooldown,
+	}
+}
+
+func (cb *CircuitBreaker) CanAttempt() bool {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	if cb.failures < cb.maxFailures {
+		return true
+	}
+	return time.Since(cb.lastFailure) > cb.cooldown
+}
+
+func (cb *CircuitBreaker) RecordSuccess() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.failures = 0
+}
+
+func (cb *CircuitBreaker) RecordFailure() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.failures++
+	cb.lastFailure = time.Now()
+}
+
+func initSessionToken() string {
+	if custom := os.Getenv("CIPHER_AUTH_TOKEN"); custom != "" {
+		return custom
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	cipherDir := filepath.Join(home, ".cipher")
+	_ = os.MkdirAll(cipherDir, 0700)
+	tokenFile := filepath.Join(cipherDir, "token")
+	if data, err := os.ReadFile(tokenFile); err == nil && len(strings.TrimSpace(string(data))) >= 16 {
+		return strings.TrimSpace(string(data))
+	}
+
+	tokenBytes := make([]byte, 32)
+	_, _ = rand.Read(tokenBytes)
+	newToken := hex.EncodeToString(tokenBytes)
+	_ = os.WriteFile(tokenFile, []byte(newToken), 0600)
+	log.Printf("[SECURITY] Generated new Cipher session secret in %s (0600 permissions)", tokenFile)
+	return newToken
+}
+
+type KeyRotator struct {
+	mu      sync.Mutex
+	keys    []string
+	current int
+}
+
+func NewKeyRotator(envKeys ...string) *KeyRotator {
+	var clean []string
+	for _, envKey := range envKeys {
+		val := os.Getenv(envKey)
+		if val == "" {
+			continue
+		}
+		raw := strings.Split(val, ",")
+		for _, k := range raw {
+			trimmed := strings.TrimSpace(k)
+			if trimmed != "" {
+				clean = append(clean, trimmed)
+			}
+		}
+	}
+	return &KeyRotator{keys: clean}
+}
+
+func (kr *KeyRotator) Get() string {
+	kr.mu.Lock()
+	defer kr.mu.Unlock()
+	if len(kr.keys) == 0 {
+		return ""
+	}
+	key := kr.keys[kr.current%len(kr.keys)]
+	kr.current++
+	return key
+}
+
+func (kr *KeyRotator) HasKeys() bool {
+	kr.mu.Lock()
+	defer kr.mu.Unlock()
+	return len(kr.keys) > 0
+}
+
 // RouterGateway implements reverse proxy logic with semantic cache and fallback
 type RouterGateway struct {
 	cfg          Config
@@ -345,6 +448,11 @@ type RouterGateway struct {
 	httpClient   *http.Client
 	fallbackHits uint64
 	proxies      map[string]*ProxyTarget
+	authToken    string
+	openAICB     *CircuitBreaker
+	groqCB       *CircuitBreaker
+	openAIKeys   *KeyRotator
+	groqKeys     *KeyRotator
 }
 
 func NewRouterGateway(cfg Config) (*RouterGateway, error) {
@@ -353,18 +461,23 @@ func NewRouterGateway(cfg Config) (*RouterGateway, error) {
 		return nil, fmt.Errorf("invalid OLLAMA_URL: %w", err)
 	}
 
-	cloudParsed, err := url.Parse(cfg.CloudURL)
-	if err != nil {
-		return nil, fmt.Errorf("invalid CLOUD_URL: %w", err)
+	var cloudParsed *url.URL
+	if cfg.CloudURL != "" {
+		cloudParsed, _ = url.Parse(cfg.CloudURL)
 	}
 
 	return &RouterGateway{
-		cfg:        cfg,
-		limiter:    NewRateLimiter(cfg.RedisAddr, cfg.RedisPassword, cfg.RateLimitRPM),
-		cache:      NewVectorSemanticCache(),
-		ollamaURL:  ollamaParsed,
-		cloudURL:   cloudParsed,
-		httpClient: &http.Client{Timeout: 30 * time.Second},
+		cfg:          cfg,
+		limiter:      NewRateLimiter(cfg.RedisAddr, cfg.RedisPassword, cfg.RateLimitRPM),
+		cache:        NewVectorSemanticCache(),
+		ollamaURL:    ollamaParsed,
+		cloudURL:     cloudParsed,
+		httpClient:   &http.Client{Timeout: 30 * time.Second},
+		authToken:    initSessionToken(),
+		openAICB:     NewCircuitBreaker(3, 30*time.Second),
+		groqCB:       NewCircuitBreaker(3, 30*time.Second),
+		openAIKeys:   NewKeyRotator("OPENAI_API_KEY", "OPENAI_API_KEYS"),
+		groqKeys:     NewKeyRotator("GROQ_API_KEY", "GROQ_API_KEYS"),
 		proxies: map[string]*ProxyTarget{
 			"/api/sec":  NewProxyTarget("/tmp/cipher/sec.sock", "127.0.0.1:8079", "/api/sec"),
 			"/api/exec": NewProxyTarget("/tmp/cipher/exec.sock", "127.0.0.1:8081", "/api/exec"),
@@ -408,6 +521,95 @@ func getClientIP(r *http.Request) string {
 		return host
 	}
 	return r.RemoteAddr
+}
+
+func (gw *RouterGateway) isAuthorized(r *http.Request) bool {
+	if gw.authToken == "" {
+		return true
+	}
+	authHeader := r.Header.Get("Authorization")
+	if strings.HasPrefix(authHeader, "Bearer ") {
+		token := strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
+		if token == gw.authToken {
+			return true
+		}
+	}
+	if r.URL.Query().Get("token") == gw.authToken {
+		return true
+	}
+	if os.Getenv("CIPHER_SKIP_AUTH") == "1" {
+		return true
+	}
+	return false
+}
+
+func (gw *RouterGateway) routeToRealCloud(ctx context.Context, bodyBytes []byte, clientReq *http.Request, originalReq *OpenAIChatCompletionRequest) (*http.Response, string, error) {
+	// 1. Try Groq (Llama-3.3-70b-versatile, ultra low latency)
+	if gw.groqKeys.HasKeys() && gw.groqCB.CanAttempt() {
+		groqKey := gw.groqKeys.Get()
+		reqCopy := *originalReq
+		if reqCopy.Model == "" || strings.HasPrefix(reqCopy.Model, "omniroute") || strings.HasPrefix(reqCopy.Model, "llama") {
+			reqCopy.Model = "llama-3.3-70b-versatile"
+		}
+		modifiedBody, _ := json.Marshal(reqCopy)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.groq.com/openai/v1/chat/completions", bytes.NewBuffer(modifiedBody))
+		if err == nil {
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+groqKey)
+			resp, err := gw.httpClient.Do(req)
+			if err == nil && resp.StatusCode < 500 {
+				gw.groqCB.RecordSuccess()
+				return resp, "cloud_groq", nil
+			}
+			gw.groqCB.RecordFailure()
+			if resp != nil {
+				_ = resp.Body.Close()
+			}
+			log.Printf("[CLOUD GATEWAY] Groq attempt failed (%v), attempting next provider...", err)
+		}
+	}
+
+	// 2. Try OpenAI (gpt-4o-mini)
+	if gw.openAIKeys.HasKeys() && gw.openAICB.CanAttempt() {
+		openaiKey := gw.openAIKeys.Get()
+		reqCopy := *originalReq
+		if reqCopy.Model == "" || strings.HasPrefix(reqCopy.Model, "omniroute") || strings.HasPrefix(reqCopy.Model, "llama") {
+			reqCopy.Model = "gpt-4o-mini"
+		}
+		modifiedBody, _ := json.Marshal(reqCopy)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.openai.com/v1/chat/completions", bytes.NewBuffer(modifiedBody))
+		if err == nil {
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+openaiKey)
+			resp, err := gw.httpClient.Do(req)
+			if err == nil && resp.StatusCode < 500 {
+				gw.openAICB.RecordSuccess()
+				return resp, "cloud_openai", nil
+			}
+			gw.openAICB.RecordFailure()
+			if resp != nil {
+				_ = resp.Body.Close()
+			}
+			log.Printf("[CLOUD GATEWAY] OpenAI attempt failed (%v), attempting next provider...", err)
+		}
+	}
+
+	// 3. Fallback to custom CLOUD_URL if configured and not empty
+	if gw.cloudURL != nil && gw.cloudURL.String() != "" && !strings.Contains(gw.cloudURL.String(), "mock/cloud") {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, gw.cloudURL.String(), bytes.NewBuffer(bodyBytes))
+		if err == nil {
+			req.Header = clientReq.Header.Clone()
+			resp, err := gw.httpClient.Do(req)
+			if err == nil && resp.StatusCode < 500 {
+				return resp, "cloud_custom", nil
+			}
+			if resp != nil {
+				_ = resp.Body.Close()
+			}
+		}
+	}
+
+	return nil, "", fmt.Errorf("all cloud upstreams unavailable: GROQ/OPENAI keys unconfigured or circuit breakers tripped")
 }
 
 func (gw *RouterGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -456,9 +658,11 @@ func (gw *RouterGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 5. Mock cloud endpoint
-	if r.URL.Path == "/mock/cloud/v1/chat/completions" {
-		gw.handleMockCloud(w, r)
+	// 5. Zero-Trust Local Session Token Gate (Pillar 3)
+	if !gw.isAuthorized(r) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"message":"Unauthorized: Invalid or missing Cipher session token. Find secret in ~/.cipher/token or pass Authorization: Bearer <token>","code":401}}`))
 		return
 	}
 
@@ -538,20 +742,32 @@ func (gw *RouterGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if resp != nil {
 				_ = resp.Body.Close()
 			}
-			log.Printf("[FALLBACK ROUTING] Ollama offline or errored (%v). Rerouting to OmniRoute Cloud...", err)
-			routeTarget = "cloud_fallback"
+			log.Printf("[FALLBACK ROUTING] Ollama offline or errored (%v). Rerouting to Real Cloud Gateway...", err)
 			fallbackTriggered = true
 			atomic.AddUint64(&gw.fallbackHits, 1)
 
-			cloudReq, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, gw.cloudURL.String(), bytes.NewBuffer(bodyBytes))
-			cloudReq.Header = r.Header.Clone()
-			resp, err = gw.httpClient.Do(cloudReq)
+			cloudResp, cloudRoute, cloudErr := gw.routeToRealCloud(r.Context(), bodyBytes, r, &chatReq)
+			if cloudErr != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write([]byte(fmt.Sprintf(`{"error":{"message":"%s","code":503,"type":"upstream_unavailable"}}`, cloudErr.Error())))
+				gw.emitTelemetry("upstream_error", tokens, time.Since(start), "cloud_fallback", http.StatusServiceUnavailable)
+				return
+			}
+			resp = cloudResp
+			routeTarget = cloudRoute
 		}
 	} else {
-		routeTarget = "cloud_high_capacity"
-		cloudReq, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, gw.cloudURL.String(), bytes.NewBuffer(bodyBytes))
-		cloudReq.Header = r.Header.Clone()
-		resp, err = gw.httpClient.Do(cloudReq)
+		cloudResp, cloudRoute, cloudErr := gw.routeToRealCloud(r.Context(), bodyBytes, r, &chatReq)
+		if cloudErr != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"error":{"message":"%s","code":503,"type":"upstream_unavailable"}}`, cloudErr.Error())))
+			gw.emitTelemetry("upstream_error", tokens, time.Since(start), "cloud_high_capacity", http.StatusServiceUnavailable)
+			return
+		}
+		resp = cloudResp
+		routeTarget = cloudRoute
 	}
 
 	if err != nil {
@@ -675,27 +891,6 @@ func (gw *RouterGateway) handleClusterStatus(w http.ResponseWriter, r *http.Requ
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-
-func (gw *RouterGateway) handleMockCloud(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(`{
-		"id": "chatcmpl-omniroute-cloud",
-		"object": "chat.completion",
-		"created": 1729800000,
-		"model": "omniroute-cloud-tier1",
-		"choices": [{
-			"index": 0,
-			"message": {
-				"role": "assistant",
-				"content": "Generated by OmniRoute Cloud Fallback Engine. High throughput guaranteed."
-			},
-			"finish_reason": "stop"
-		}],
-		"usage": {"prompt_tokens": 1050, "completion_tokens": 18, "total_tokens": 1068}
-	}`))
-}
-
 func (gw *RouterGateway) emitTelemetry(eventType string, tokens int, latency time.Duration, route string, status int) {
 	if gw.cfg.TelemetryEndpoint == "" {
 		return
@@ -747,7 +942,7 @@ func main() {
 	cfg := Config{
 		Port:              getEnv("PORT", "8080"),
 		OllamaURL:         getEnv("OLLAMA_URL", "http://localhost:11434/v1/chat/completions"),
-		CloudURL:          getEnv("CLOUD_URL", "http://localhost:8080/mock/cloud/v1/chat/completions"),
+		CloudURL:          getEnv("CLOUD_URL", ""),
 		RedisAddr:         getEnv("REDIS_ADDR", "localhost:6379"),
 		RedisPassword:     getEnv("REDIS_PASSWORD", ""),
 		RateLimitRPM:      rpm,
