@@ -4,6 +4,8 @@ Unified HTTP ingress reverse proxy, semantic vector cache, and circuit breaker.
 
 Written in pure Go. Eliminates host port sprawl by aggregating all backend microservices via Unix domain sockets in `/tmp/cipher/*.sock` behind port `8080`, secured with local cryptographic session token authorization.
 
+Looking for a plain-English, non-technical summary? See [EXPLAINER.md](EXPLAINER.md).
+
 ---
 
 ## Routing Architecture
