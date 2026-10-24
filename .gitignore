@@ -1,0 +1,11 @@
+# Binaries
+macr-router
+*.exe
+*.test
+
+# Environment
+.env
+.env.*
+
+# OS
+.DS_Store
