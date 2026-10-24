@@ -1,4 +1,4 @@
-module github.com/sshloktiwarii/foundry-router
+module github.com/sshloktiwarii/cipher-route
 
 go 1.24
 

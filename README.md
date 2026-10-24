@@ -1,6 +1,6 @@
-# Foundry Router: Model-Agnostic Context Gateway
+# cipher-route: Intelligent Model-Agnostic Context Gateway
 
-A high-throughput reverse proxy and intelligent traffic gateway written in Go that intercepts OpenAI-compatible API requests. It dynamically routes requests between local Ollama instances and cloud endpoints based on a strict token-budget threshold, with Redis rate limiting and asynchronous telemetry streaming to `foundry-pulse`.
+A high-throughput reverse proxy and intelligent traffic gateway written in Go that intercepts OpenAI-compatible API requests. It dynamically routes requests between local Ollama instances and cloud endpoints based on a strict token-budget threshold, with Redis rate limiting and asynchronous telemetry streaming to `cipher-log`.
 
 ## Features
 - **Dynamic Token Budget Routing**: Evaluates OpenAI Chat Completion prompt payloads:
