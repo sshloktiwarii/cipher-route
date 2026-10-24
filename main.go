@@ -3,20 +3,23 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -32,33 +35,159 @@ type Config struct {
 	RedisPassword     string
 	RateLimitRPM      int
 	TokenThreshold    int
+	SimilarityCutoff  float64
 	TelemetryEndpoint string
 }
 
 // OpenAIChatCompletionRequest matches the OpenAI API payload
 type OpenAIChatCompletionRequest struct {
-	Model       string                   `json:"model"`
-	Messages    []OpenAIChatMessage      `json:"messages"`
-	Temperature *float64                 `json:"temperature,omitempty"`
-	MaxTokens   *int                     `json:"max_tokens,omitempty"`
-	Stream      bool                     `json:"stream,omitempty"`
-	Extra       map[string]interface{}   `json:"-"`
+	Model       string              `json:"model"`
+	Messages    []OpenAIChatMessage `json:"messages"`
+	Temperature *float64            `json:"temperature,omitempty"`
+	MaxTokens   *int                `json:"max_tokens,omitempty"`
+	Stream      bool                `json:"stream,omitempty"`
 }
 
-// OpenAIChatMessage represents a message in the conversation
 type OpenAIChatMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
 	Name    string `json:"name,omitempty"`
 }
 
-// TelemetryPayload represents the contract for Project 4 (Telemetry Engine)
-type TelemetryPayload struct {
-	Source    string                 `json:"source"`
-	EventType string                 `json:"event_type"`
-	Metrics   map[string]float64     `json:"metrics"`
-	Metadata  map[string]string      `json:"metadata"`
-	Timestamp string                 `json:"timestamp"`
+type CachedResponse struct {
+	Body       []byte
+	Headers    http.Header
+	Tokens     int
+	CachedAt   time.Time
+	Hits       int
+	Vector     []float64
+	PromptText string
+}
+
+// VectorSemanticCache provides in-memory vector embedding similarity matching
+type VectorSemanticCache struct {
+	mu        sync.RWMutex
+	exactMap  map[string]*CachedResponse
+	vectorLog []*CachedResponse
+	dim       int
+	hitCount  uint64
+	missCount uint64
+}
+
+func NewVectorSemanticCache() *VectorSemanticCache {
+	return &VectorSemanticCache{
+		exactMap:  make(map[string]*CachedResponse),
+		vectorLog: make([]*CachedResponse, 0, 500),
+		dim:       128,
+	}
+}
+
+// ComputeEmbedding generates a normalized 128-dim vector embedding using character n-gram hashing
+func (c *VectorSemanticCache) ComputeEmbedding(text string) []float64 {
+	vec := make([]float64, c.dim)
+	normalized := strings.ToLower(strings.TrimSpace(text))
+	runes := []rune(normalized)
+
+	if len(runes) < 2 {
+		return vec
+	}
+
+	for i := 0; i < len(runes)-1; i++ {
+		bigram := string(runes[i : i+2])
+		h := sha256.Sum256([]byte(bigram))
+		idx := int(h[0]) % c.dim
+		sign := 1.0
+		if h[1]%2 == 0 {
+			sign = -1.0
+		}
+		vec[idx] += sign * (float64(h[2]) / 255.0)
+	}
+
+	// L2 Normalize
+	var sumSquares float64
+	for _, val := range vec {
+		sumSquares += val * val
+	}
+	if norm := math.Sqrt(sumSquares); norm > 0 {
+		for i := range vec {
+			vec[i] /= norm
+		}
+	}
+	return vec
+}
+
+// CosineSimilarity computes the dot product of two L2-normalized vectors
+func CosineSimilarity(a, b []float64) float64 {
+	if len(a) != len(b) || len(a) == 0 {
+		return 0
+	}
+	var dot float64
+	for i := range a {
+		dot += a[i] * b[i]
+	}
+	return math.Max(0.0, math.Min(1.0, dot))
+}
+
+// FindMatch searches for an exact hash hit or semantic cosine match >= similarity threshold
+func (c *VectorSemanticCache) FindMatch(prompt string, threshold float64) (*CachedResponse, float64) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	hash := sha256Hex(prompt)
+	if match, exists := c.exactMap[hash]; exists {
+		atomic.AddUint64(&c.hitCount, 1)
+		match.Hits++
+		return match, 1.0
+	}
+
+	queryVec := c.ComputeEmbedding(prompt)
+	var bestMatch *CachedResponse
+	var bestSim float64
+
+	for _, item := range c.vectorLog {
+		sim := CosineSimilarity(queryVec, item.Vector)
+		if sim > bestSim {
+			bestSim = sim
+			bestMatch = item
+		}
+	}
+
+	if bestSim >= threshold && bestMatch != nil {
+		atomic.AddUint64(&c.hitCount, 1)
+		bestMatch.Hits++
+		return bestMatch, bestSim
+	}
+
+	atomic.AddUint64(&c.missCount, 1)
+	return nil, bestSim
+}
+
+func (c *VectorSemanticCache) Put(prompt string, body []byte, headers http.Header, tokens int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	hash := sha256Hex(prompt)
+	vec := c.ComputeEmbedding(prompt)
+
+	entry := &CachedResponse{
+		Body:       body,
+		Headers:    headers.Clone(),
+		Tokens:     tokens,
+		CachedAt:   time.Now(),
+		Vector:     vec,
+		PromptText: prompt,
+	}
+
+	c.exactMap[hash] = entry
+	if len(c.vectorLog) >= 500 {
+		c.vectorLog = c.vectorLog[1:]
+	}
+	c.vectorLog = append(c.vectorLog, entry)
+}
+
+func sha256Hex(text string) string {
+	h := sha256.Sum256([]byte(text))
+	return hex.EncodeToString(h[:])
 }
 
 // RateLimiter manages client quotas with Redis and in-memory fallback
@@ -108,7 +237,6 @@ func (rl *RateLimiter) Allow(clientIP string) (bool, error) {
 		key := fmt.Sprintf("rl:macr:%s:%d", clientIP, time.Now().Unix()/60)
 		count, err := rl.client.Incr(ctx, key).Result()
 		if err != nil {
-			log.Printf("[WARN] Redis Incr failed (%v), falling back to in-memory limiter", err)
 			return rl.allowInMemory(clientIP), nil
 		}
 		if count == 1 {
@@ -116,7 +244,6 @@ func (rl *RateLimiter) Allow(clientIP string) (bool, error) {
 		}
 		return count <= int64(rl.limitRPM), nil
 	}
-
 	return rl.allowInMemory(clientIP), nil
 }
 
@@ -134,13 +261,15 @@ func (rl *RateLimiter) allowInMemory(clientIP string) bool {
 	return rl.localCounts[clientIP] <= rl.limitRPM
 }
 
-// RouterGateway implements reverse proxy logic based on token count
+// RouterGateway implements reverse proxy logic with semantic cache and fallback
 type RouterGateway struct {
-	cfg         Config
-	limiter     *RateLimiter
-	ollamaURL   *url.URL
-	cloudURL    *url.URL
-	httpClient  *http.Client
+	cfg          Config
+	limiter      *RateLimiter
+	cache        *VectorSemanticCache
+	ollamaURL    *url.URL
+	cloudURL     *url.URL
+	httpClient   *http.Client
+	fallbackHits uint64
 }
 
 func NewRouterGateway(cfg Config) (*RouterGateway, error) {
@@ -157,13 +286,24 @@ func NewRouterGateway(cfg Config) (*RouterGateway, error) {
 	return &RouterGateway{
 		cfg:        cfg,
 		limiter:    NewRateLimiter(cfg.RedisAddr, cfg.RedisPassword, cfg.RateLimitRPM),
+		cache:      NewVectorSemanticCache(),
 		ollamaURL:  ollamaParsed,
 		cloudURL:   cloudParsed,
-		httpClient: &http.Client{Timeout: 5 * time.Second},
+		httpClient: &http.Client{Timeout: 30 * time.Second},
 	}, nil
 }
 
-// EstimateTokens calculates approximate token size for OpenAI messages (~4 chars per token)
+func ExtractPromptText(req *OpenAIChatCompletionRequest) string {
+	var sb strings.Builder
+	for _, m := range req.Messages {
+		sb.WriteString(m.Role)
+		sb.WriteString(":")
+		sb.WriteString(m.Content)
+		sb.WriteString("\n")
+	}
+	return sb.String()
+}
+
 func EstimateTokens(req *OpenAIChatCompletionRequest) int {
 	totalChars := 0
 	for _, m := range req.Messages {
@@ -191,15 +331,30 @@ func getClientIP(r *http.Request) string {
 func (gw *RouterGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
-	// Health check
-	if r.URL.Path == "/healthz" {
-		w.Header().Set("Content-Type", "application/json")
+	// CORS headers for Next.js dashboard
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"healthy","service":"macr"}`))
 		return
 	}
 
-	// Mock cloud upstream endpoint for testing
+	// 1. Healthcheck
+	if r.URL.Path == "/healthz" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"healthy","service":"macr-maximized","semantic_cache":true}`))
+		return
+	}
+
+	// 2. Metrics endpoint for Next.js Dashboard
+	if r.URL.Path == "/api/metrics" {
+		gw.handleDashboardMetrics(w, r)
+		return
+	}
+
+	// 3. Mock cloud endpoint
 	if r.URL.Path == "/mock/cloud/v1/chat/completions" {
 		gw.handleMockCloud(w, r)
 		return
@@ -210,18 +365,18 @@ func (gw *RouterGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Rate limiting
 	clientIP := getClientIP(r)
 	allowed, err := gw.limiter.Allow(clientIP)
 	if err != nil || !allowed {
 		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Retry-After", "60")
 		w.WriteHeader(http.StatusTooManyRequests)
-		_, _ = w.Write([]byte(`{"error":{"message":"Rate limit exceeded","type":"rate_limit_error","code":429}}`))
+		_, _ = w.Write([]byte(`{"error":{"message":"Rate limit exceeded","code":429}}`))
 		gw.emitTelemetry("rate_limited", 0, time.Since(start), "none", http.StatusTooManyRequests)
 		return
 	}
 
-	// Buffer and inspect body
+	// Read & Parse payload
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, `{"error":{"message":"Failed to read request body"}}`, http.StatusBadRequest)
@@ -235,78 +390,134 @@ func (gw *RouterGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	promptText := ExtractPromptText(&chatReq)
 	tokens := EstimateTokens(&chatReq)
-	var targetURL *url.URL
+
+	// 4. Feature 1: Semantic Caching
+	if cached, similarity := gw.cache.FindMatch(promptText, gw.cfg.SimilarityCutoff); cached != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-MACR-Cache", "HIT")
+		w.Header().Set("X-MACR-Similarity", fmt.Sprintf("%.4f", similarity))
+		w.Header().Set("X-MACR-Route-Selected", "semantic_cache")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(cached.Body)
+
+		log.Printf("[CACHE HIT] Client: %s | Sim: %.4f | Saved Tokens: %d", clientIP, similarity, tokens)
+		gw.emitTelemetry("cache_hit", tokens, time.Since(start), "semantic_cache", http.StatusOK)
+		return
+	}
+
+	// 5. Feature 2: Fallback Routing (Try Ollama -> on failure / timeout fallback to Cloud)
+	var resp *http.Response
 	var routeTarget string
+	var fallbackTriggered bool
 
 	if tokens < gw.cfg.TokenThreshold {
-		targetURL = gw.ollamaURL
 		routeTarget = "local_ollama"
-	} else {
-		targetURL = gw.cloudURL
-		routeTarget = "cloud_endpoint"
-	}
+		// Try Ollama with low-latency timeout
+		ollamaReq, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, gw.ollamaURL.String(), bytes.NewBuffer(bodyBytes))
+		ollamaReq.Header = r.Header.Clone()
 
-	log.Printf("[ROUTE] Request from %s | Tokens: %d | Route: %s -> %s", clientIP, tokens, routeTarget, targetURL.String())
+		ctxTimeout, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		resp, err = gw.httpClient.Do(ollamaReq.WithContext(ctxTimeout))
+		cancel()
 
-	// Prepare proxy
-	proxy := httputil.NewSingleHostReverseProxy(targetURL)
-	proxy.Director = func(req *http.Request) {
-		req.Host = targetURL.Host
-		req.URL.Scheme = targetURL.Scheme
-		req.URL.Host = targetURL.Host
-		req.URL.Path = targetURL.Path
-		if req.URL.Path == "" {
-			req.URL.Path = "/v1/chat/completions"
+		// If Ollama is down, times out, or errors -> execute Fallback Routing
+		if err != nil || (resp != nil && resp.StatusCode >= 500) {
+			if resp != nil {
+				_ = resp.Body.Close()
+			}
+			log.Printf("[FALLBACK ROUTING] Ollama offline or errored (%v). Rerouting to OmniRoute Cloud...", err)
+			routeTarget = "cloud_fallback"
+			fallbackTriggered = true
+			atomic.AddUint64(&gw.fallbackHits, 1)
+
+			cloudReq, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, gw.cloudURL.String(), bytes.NewBuffer(bodyBytes))
+			cloudReq.Header = r.Header.Clone()
+			resp, err = gw.httpClient.Do(cloudReq)
 		}
-		req.Header.Set("X-Forwarded-Host", r.Host)
-		req.Header.Set("X-MACR-Tokens", strconv.Itoa(tokens))
-		req.Header.Set("X-MACR-Route", routeTarget)
-		req.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-		req.ContentLength = int64(len(bodyBytes))
+	} else {
+		routeTarget = "cloud_high_capacity"
+		cloudReq, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, gw.cloudURL.String(), bytes.NewBuffer(bodyBytes))
+		cloudReq.Header = r.Header.Clone()
+		resp, err = gw.httpClient.Do(cloudReq)
 	}
 
-	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, proxyErr error) {
-		log.Printf("[ERROR] Proxy upstream error to %s: %v", targetURL.String(), proxyErr)
-		rw.Header().Set("Content-Type", "application/json")
-		rw.WriteHeader(http.StatusBadGateway)
-		_, _ = rw.Write([]byte(fmt.Sprintf(`{"error":{"message":"Upstream destination unreachable: %v","target":"%s"}}`, proxyErr, routeTarget)))
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":{"message":"Upstream route failed: %v"}}`, err), http.StatusBadGateway)
 		gw.emitTelemetry("upstream_error", tokens, time.Since(start), routeTarget, http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		http.Error(w, `{"error":{"message":"Failed to read upstream response"}}`, http.StatusBadGateway)
+		return
 	}
 
-	proxy.ModifyResponse = func(resp *http.Response) error {
-		duration := time.Since(start)
-		resp.Header.Set("X-MACR-Route-Selected", routeTarget)
-		resp.Header.Set("X-MACR-Estimated-Tokens", strconv.Itoa(tokens))
-		gw.emitTelemetry("request_routed", tokens, duration, routeTarget, resp.StatusCode)
-		return nil
+	// Cache successful responses for semantic caching
+	if resp.StatusCode == http.StatusOK && !chatReq.Stream {
+		gw.cache.Put(promptText, respBody, resp.Header, tokens)
 	}
 
-	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-	proxy.ServeHTTP(w, r)
+	// Write response headers and body
+	for k, v := range resp.Header {
+		w.Header()[k] = v
+	}
+	w.Header().Set("X-MACR-Cache", "MISS")
+	w.Header().Set("X-MACR-Route-Selected", routeTarget)
+	if fallbackTriggered {
+		w.Header().Set("X-MACR-Fallback", "TRUE")
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write(respBody)
+
+	gw.emitTelemetry("request_routed", tokens, time.Since(start), routeTarget, resp.StatusCode)
+}
+
+func (gw *RouterGateway) handleDashboardMetrics(w http.ResponseWriter, r *http.Request) {
+	hits := atomic.LoadUint64(&gw.cache.hitCount)
+	misses := atomic.LoadUint64(&gw.cache.missCount)
+	total := hits + misses
+	hitRate := 0.0
+	if total > 0 {
+		hitRate = float64(hits) / float64(total) * 100.0
+	}
+
+	metrics := map[string]interface{}{
+		"cache_hits":        hits,
+		"cache_misses":      misses,
+		"total_requests":    total,
+		"cache_hit_rate":    fmt.Sprintf("%.1f%%", hitRate),
+		"fallback_events":   atomic.LoadUint64(&gw.fallbackHits),
+		"token_threshold":   gw.cfg.TokenThreshold,
+		"similarity_cutoff": gw.cfg.SimilarityCutoff,
+		"timestamp":         time.Now().UTC().Format(time.RFC3339),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(metrics)
 }
 
 func (gw *RouterGateway) handleMockCloud(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(`{
-		"id": "chatcmpl-mock-cloud-999",
+		"id": "chatcmpl-omniroute-cloud",
 		"object": "chat.completion",
 		"created": 1729800000,
-		"model": "cloud-mock-model",
+		"model": "omniroute-cloud-tier1",
 		"choices": [{
 			"index": 0,
 			"message": {
 				"role": "assistant",
-				"content": "This response was routed through the Cloud High-Capacity fallback endpoint (Tokens >= 1000)."
+				"content": "Generated by OmniRoute Cloud Fallback Engine. High throughput guaranteed."
 			},
 			"finish_reason": "stop"
 		}],
-		"usage": {
-			"prompt_tokens": 1050,
-			"completion_tokens": 24,
-			"total_tokens": 1074
-		}
+		"usage": {"prompt_tokens": 1050, "completion_tokens": 18, "total_tokens": 1068}
 	}`))
 }
 
@@ -316,38 +527,32 @@ func (gw *RouterGateway) emitTelemetry(eventType string, tokens int, latency tim
 	}
 
 	go func() {
-		payload := TelemetryPayload{
-			Source:    "macr-gateway",
-			EventType: eventType,
-			Metrics: map[string]float64{
+		payload := map[string]interface{}{
+			"source":     "macr-router-maximized",
+			"event_type": eventType,
+			"metrics": map[string]float64{
 				"token_count": float64(tokens),
 				"latency_ms":  float64(latency.Milliseconds()),
-				"http_status": float64(status),
+				"status":      float64(status),
 			},
-			Metadata: map[string]string{
+			"metadata": map[string]string{
 				"route":  route,
 				"status": strconv.Itoa(status),
 			},
-			Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+			"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
 		}
 
-		body, err := json.Marshal(payload)
-		if err != nil {
-			return
-		}
-
+		body, _ := json.Marshal(payload)
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 		defer cancel()
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, gw.cfg.TelemetryEndpoint, bytes.NewBuffer(body))
-		if err != nil {
-			return
-		}
-		req.Header.Set("Content-Type", "application/json")
-
-		resp, err := gw.httpClient.Do(req)
-		if err == nil && resp != nil {
-			_ = resp.Body.Close()
+		if err == nil {
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := gw.httpClient.Do(req)
+			if err == nil && resp != nil {
+				_ = resp.Body.Close()
+			}
 		}
 	}()
 }
@@ -362,6 +567,7 @@ func getEnv(key, defaultVal string) string {
 func main() {
 	rpm, _ := strconv.Atoi(getEnv("RATE_LIMIT_RPM", "120"))
 	threshold, _ := strconv.Atoi(getEnv("TOKEN_THRESHOLD", "1000"))
+	similarity, _ := strconv.ParseFloat(getEnv("SIMILARITY_CUTOFF", "0.95"), 64)
 
 	cfg := Config{
 		Port:              getEnv("PORT", "8080"),
@@ -371,6 +577,7 @@ func main() {
 		RedisPassword:     getEnv("REDIS_PASSWORD", ""),
 		RateLimitRPM:      rpm,
 		TokenThreshold:    threshold,
+		SimilarityCutoff:  similarity,
 		TelemetryEndpoint: getEnv("TELEMETRY_ENDPOINT", "http://localhost:8082/ingest"),
 	}
 
@@ -391,21 +598,16 @@ func main() {
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
 	go func() {
-		log.Printf("[INIT] Model-Agnostic Context Router (MACR) listening on port :%s", cfg.Port)
-		log.Printf("[INIT] Threshold: < %d tokens -> Ollama | >= %d tokens -> Cloud", cfg.TokenThreshold, cfg.TokenThreshold)
+		log.Printf("[INIT] Maximized MACR Router listening on :%s", cfg.Port)
+		log.Printf("[INIT] Features: Semantic Caching (Similarity >= %.2f) | Fallback Routing Active", cfg.SimilarityCutoff)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("[FATAL] HTTP server error: %v", err)
 		}
 	}()
 
 	<-stop
-	log.Println("[SHUTDOWN] Gracefully terminating MACR gateway...")
-
+	log.Println("[SHUTDOWN] Terminating MACR Gateway...")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-
-	if err := server.Shutdown(ctx); err != nil {
-		log.Printf("[ERROR] Server forced to shutdown: %v", err)
-	}
-	log.Println("[SHUTDOWN] MACR server exited clean")
+	_ = server.Shutdown(ctx)
 }
