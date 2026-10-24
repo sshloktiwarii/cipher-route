@@ -178,10 +178,12 @@ func (c *VectorSemanticCache) Put(prompt string, body []byte, headers http.Heade
 		PromptText: prompt,
 	}
 
-	c.exactMap[hash] = entry
 	if len(c.vectorLog) >= 500 {
+		old := c.vectorLog[0]
+		delete(c.exactMap, sha256Hex(old.PromptText))
 		c.vectorLog = c.vectorLog[1:]
 	}
+	c.exactMap[hash] = entry
 	c.vectorLog = append(c.vectorLog, entry)
 }
 
@@ -376,7 +378,8 @@ func (gw *RouterGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Read & Parse payload
+	// Read & Parse payload with 2MB maximum limit
+	r.Body = http.MaxBytesReader(w, r.Body, 2*1024*1024)
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, `{"error":{"message":"Failed to read request body"}}`, http.StatusBadRequest)
