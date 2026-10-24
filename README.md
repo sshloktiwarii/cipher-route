@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/header.svg" width="100%" alt="Cipher Header Banner" />
+</p>
+
 # cipher-route
 
 Unified HTTP ingress reverse proxy, semantic vector cache, and circuit breaker.
